@@ -50,6 +50,18 @@ PRESET_LOG_SOURCES: dict[str, LogSourceConfig] = {
         collect_method="file_tail",
         access_state="已接入",
     ),
+    # 历史批次日志：应用侧早先的日志格式不带日志级别，接入时用宽松的正则，
+    # 缺 level 的行会以"字段缺失"进入失败行台账，等待纠错单回修。
+    "app-legacy": LogSourceConfig(
+        source_id="LOG_-0004",
+        source_name="LegacyBatchLog",
+        app_label="legacy-batch",
+        log_path="/var/log/app/legacy-batch.log",
+        log_format="custom",
+        encoding="utf-8",
+        collect_method="file_tail",
+        access_state="已接入",
+    ),
 }
 
 # ---------- 预置解析规则 ----------
@@ -79,6 +91,16 @@ PRESET_PARSE_RULES: list[ParseRule] = [
         regex_pattern=r'^([\w-]+\s+\d+\s+\d{2}:\d{2}:\d{2})\s+([\w-]+)\s+([\w-]+)\[(\d+)\]:\s+(\w+)\s+(.*)$',
         field_names=["sys_time", "hostname", "process", "pid", "action", "detail"],
         time_format="%b %d %H:%M:%S",
+        priority=10,
+        state="生效中",
+    ),
+    # 历史批次日志：level 分组可缺省，缺省时按字段缺失进入失败行台账。
+    ParseRule(
+        rule_id="PARS-0004",
+        source_id="LOG_-0004",
+        regex_pattern=r'^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{3})\s+\[([^\]]+)\]\s+(?:(INFO|WARN|ERROR|DEBUG)\s+)?(\S+)\s+-\s+(.*)$',
+        field_names=["timestamp", "thread", "level", "logger", "message"],
+        time_format="%Y-%m-%d %H:%M:%S.%f",
         priority=10,
         state="生效中",
     ),
@@ -156,7 +178,11 @@ class IngestPipeline:
         return entries
 
     def apply_parse_rules(self, entries: list[LogEntry], rule: ParseRule) -> list[LogEntry]:
-        """用解析规则从日志条目中提取字段。"""
+        """用解析规则从日志条目中提取字段。
+
+        回修进来的条目同样走这一入口：修订内容只有在这里得到有效字段，
+        才有资格被 ``classify_events`` 消费。回修追溯信息随条目原样保留。
+        """
         for entry in entries:
             if entry.parse_status == ParseResultStatus.FORMAT_MISMATCH:
                 continue
@@ -186,6 +212,9 @@ class IngestPipeline:
 
         数据流入口：event_store ← 解析后的 LogEntry
         分类依据：日志级别（app log → error/access）或来源标识
+
+        失败行回修批次也从这里进入：条目上携带的 ``correction`` 会原样写进
+        EventRecord，用于追溯选用的纠错单和原有失败原因。
         """
         records: list[EventRecord] = []
         host_counter: dict[str, int] = {}
@@ -196,8 +225,14 @@ class IngestPipeline:
             host = entry.parsed_fields.get("client_ip") or entry.parsed_fields.get("hostname") or "unknown"
             host_counter[host] = host_counter.get(host, 0) + 1
             partition = f"{datetime.now():%Y%m%d}"
+            correction = dict(entry.correction)
+            if correction.get("ticket_id"):
+                # 回修记录用纠错单编号 + 版本做记录号，便于回查选用的那份单。
+                record_id = f"EVEN-{correction['ticket_id']}-{correction.get('version', '1')}"
+            else:
+                record_id = f"EVEN-{host_counter[host]:06d}"
             record = EventRecord(
-                record_id=f"EVEN-{host_counter[host]:06d}",
+                record_id=record_id,
                 event_type=event_type,
                 original_content=entry.raw_line[:500],
                 parsed_fields=dict(entry.parsed_fields),
@@ -207,8 +242,20 @@ class IngestPipeline:
                 source_host=host,
                 store_partition=partition,
                 index_state="已写入",
+                correction=correction,
             )
             records.append(record)
+        return records
+
+    def classify_rework_batch(self, batch: Any) -> list[EventRecord]:
+        """消费有效回修事件批次（``ReworkBatch``）并写出事件记录。
+
+        事件分类侧只读取有效回修批次，不直接遍历失败行台账；这样已成功的行
+        和未通过校验的纠错单都不会被重新发出。
+        """
+        entries = list(getattr(batch, "entries", []) or [])
+        records = self.classify_events(entries)
+        self.store_events(records)
         return records
 
     def store_events(self, records: list[EventRecord]) -> int:
@@ -412,13 +459,26 @@ class IngestPipeline:
     # ---------- 内部辅助方法 ----------
 
     def _classify_entry(self, entry: LogEntry) -> EventTypeDef:
-        """根据解析字段对日志条目做事件分类。"""
+        """根据解析字段对日志条目做事件分类。
+
+        - 级别为 ERROR 的日志归为错误事件；
+        - 级别或动作字段出现认证关键字（LOGIN/LOGOUT/AUTH…）归为认证事件；
+        - 其余归为访问事件。
+        """
         fields = entry.parsed_fields or {}
         level = fields.get("level", "").upper()
         if level == "ERROR":
             return PRESET_EVENT_TYPES.get("error", PRESET_EVENT_TYPES["access"])
+        auth_keywords = ("LOGIN", "LOGOUT", "AUTH", "AUTHENTICATE")
         action = fields.get("action", "").upper()
-        if action in ("LOGIN", "LOGOUT", "AUTH", "AUTHENTICATE"):
+        message = fields.get("message", "").upper()
+        message_tokens = {
+            token for token in
+            message.replace("=", " ").replace("：", " ").replace(":", " ").split()
+        }
+        if action in auth_keywords or level in auth_keywords:
+            return PRESET_EVENT_TYPES.get("auth", PRESET_EVENT_TYPES["access"])
+        if message_tokens & set(auth_keywords):
             return PRESET_EVENT_TYPES.get("auth", PRESET_EVENT_TYPES["access"])
         return PRESET_EVENT_TYPES.get("access", PRESET_EVENT_TYPES["access"])
 

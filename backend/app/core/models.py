@@ -92,7 +92,14 @@ class ParseRule:
             if m is None:
                 return ParseResultStatus.FORMAT_MISMATCH, None
             fields = dict(zip(self.field_names, m.groups()))
-            missing = [name for name in self.field_names if name not in fields]
+            # 正则可能把某个分组匹配成 None，或匹配到空串；这两种情况都算字段缺失，
+            # 采集侧需要把它们登记为可回修的失败行，而不是当成解析成功。
+            missing = [
+                name for name in self.field_names
+                if name not in fields
+                or fields[name] is None
+                or not str(fields[name]).strip()
+            ]
             if missing:
                 return ParseResultStatus.FIELD_MISSING, fields
             return ParseResultStatus.OK, fields
@@ -111,6 +118,9 @@ class LogEntry:
     event_time: datetime | None = None
     host: str = ""
     checksum: str = field(default="")
+    # 失败行回修进来时携带的追溯信息（纠错单、原行证据、旧失败原因）。
+    # 正常采集的日志行保持为空字典。
+    correction: dict[str, Any] = field(default_factory=dict)
 
     def compute_checksum(self) -> str:
         """基于原始行和解析字段计算内容校验哈希。"""
@@ -226,6 +236,9 @@ class EventRecord:
     source_host: str
     store_partition: str = ""
     index_state: str = "已写入"
+    # 失败行回修产生的记录在这里留下可追溯依据：选用的纠错单、原失败原因、原行证据。
+    # 正常解析产生的记录保持为空字典。
+    correction: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
